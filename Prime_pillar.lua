@@ -37,6 +37,9 @@ T_SPEED = 6000 -- In mm/m (6000mm/m = 100mm/s)
 -- Pause for x seconds then print prime pillar and return to printing (ZERO will disable)
 SECONDS = 2
 
+-- If using Cura then set to true. If using Kisslicer then set to false
+CURA = false
+
 -- Extrusion mode (Absolute E because Cura does not support Relative or use ABS_2_REL post processor first https://github.com/Intrinsically-Sublime/ABS_2_REL )
 ABSOLUTE_E = true
 
@@ -193,8 +196,11 @@ for line in fin:lines() do
 		PILLAR(line)
 		
 	else
-        fout:write( line .. "\r\n" )
-        
+		if CURA then
+		        fout:write( line .. "\r\n" )
+		else
+		        fout:write( line)
+		end
 	end
 	
 	LAST_LAYER = LAYER
