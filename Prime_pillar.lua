@@ -18,6 +18,8 @@ SLICE_DIAMETER = 3
 
 -- Layer height used to slice (mm)
 LAYER_HEIGHT = 0.2
+-- First layer Z value (Z-offset set in slicer will effect this)
+FIRST_L_HEIGHT = 0.2
 
 -- Nozzle diameter (mm)
 NOZZLE_DIA = 0.5
@@ -37,9 +39,6 @@ T_SPEED = 6000 -- In mm/m (6000mm/m = 100mm/s)
 -- Pause for x seconds then print prime pillar and return to printing (ZERO will disable)
 SECONDS = 2
 
--- Extrusion mode (Absolute E because Cura does not support Relative or use ABS_2_REL post processor first https://github.com/Intrinsically-Sublime/ABS_2_REL )
-ABSOLUTE_E = true
-
 -- Prime pillar location
 PPL_X = 10
 PPL_Y = 10
@@ -48,14 +47,20 @@ PPL_Y = 10
 P_SIZE_X = 10
 P_SIZE_Y = 10
 
--- Prime pillar raft inflation (Raft will be this many mm larger than the prime pillar)
+-- Pillar Z roof (stop pillar after this many layers)
+PILLAR_ROOF = 999
+
+-- Prime pillar raft inflation (Raft will be this many mm larger on each side than the prime pillar)
 RAFT_INFLATE = 2
 
--- Raft extrusion in percent
+-- Raft extrusion in percent of pillar extrusion
 RAFT_GAIN = 110
 
 -- Raft line spacing
 RAFT_SPACING = 2
+
+-- Raft thickness (layer count)
+RAFT_THICKNESS = 3
 
 -----------------------------------------------------------------------------
 -->>>>>>>>>>>>>>>>>>>>>>>>>>> END USER SETTINGS <<<<<<<<<<<<<<<<<<<<<<<<<<<--
@@ -64,16 +69,19 @@ RAFT_SPACING = 2
 -- open files
 collectgarbage()  -- ensure unused files are closed
 local fin = assert( io.open( arg[1] ) ) -- reading
-local fout = assert( io.open( arg[1] .. ".processed", "wb" ) ) -- writing must be binary
+local fout = assert( io.open( arg[1] .. ".processed.gcode", "wb" ) ) -- writing must be binary
 
 SLICE_AREA = (3.14159*((SLICE_DIAMETER*0.5)*(SLICE_DIAMETER*0.5)))
 
 LAYER = 0
+LAST_LAYER = 0
 LAST_E = 0
+LAST_X = 0
+LAST_Y = 0
 
 -- Creates arrays of Prime Pillar Points (X and Y coordinates)
-Get_PPP_X = {[0]=P_SIZE_X}
-Get_PPP_Y = {[0]=P_SIZE_Y}
+Get_PPP_X = {[0]=0}
+Get_PPP_Y = {[0]=0}
 for i=1, 7 do
 	Get_PPP_X[i] = P_SIZE_X*(i*0.125)
 	Get_PPP_Y[i] = P_SIZE_Y*(i*0.125)
@@ -150,8 +158,8 @@ R_MIN_X = PPL_X-(R_SIZE_X/2)
 R_MAX_X = R_MIN_X+R_SIZE_X
 R_MIN_Y = PPL_Y-(R_SIZE_Y/2)
 R_MAX_Y = R_MIN_Y+R_SIZE_Y
--- Calculate the distance between paths
-R_SPACES = (NOZZLE_DIA*1.1)*RAFT_SPACING
+-- Calculate the distance between perimeter points
+R_SPACES = NOZZLE_DIA*RAFT_SPACING
 R_X_STEP = R_SIZE_X/(math.floor(R_SIZE_X/R_SPACES))
 R_Y_STEP = R_SIZE_Y/(math.floor(R_SIZE_Y/R_SPACES))
 R_X_COUNT = R_SIZE_X/R_X_STEP
@@ -178,28 +186,64 @@ for i=1, RP_COUNT do
 	Get_RP_X[i] = math.floor((value_1*10000)+0.5)*0.0001
 	Get_RP_Y[i] = math.floor((value_2*10000)+0.5)*0.0001
 end
-
-function DRAW_RAFT(line)
-
-	fout:write(";\r\n;Prime pillar raft \r\n")
-	UN_RETRACT()
-	ABS_E = LAST_E
-	TRAVEL(R_MIN_X,R_MIN_Y)
-	SET_FLOW(RAFT_GAIN)
-	DRAW_LINE(R_MIN_X,R_MAX_Y)
-	DRAW_LINE(R_MAX_X,R_MAX_Y)
-	DRAW_LINE(R_MAX_X,R_MIN_Y)
-	DRAW_LINE(R_MIN_X,R_MIN_Y)
-	for i=1, RP_COUNT do
-		DRAW_LINE(Get_RP_X[i],Get_RP_Y[i])
-		DRAW_LINE(Get_RP_X[RP_COUNT-(i-1)],Get_RP_Y[RP_COUNT-(i-1)])
+-- Turn previous Raft points 90 degrees
+Get_RP_X_90 = {}
+Get_RP_Y_90 = {}
+for i=1, RP_COUNT do
+	if i <= RP_COUNT-R_Y_COUNT then
+		Get_RP_X_90[i] = Get_RP_X[R_Y_COUNT+i]
+		Get_RP_Y_90[i] = Get_RP_Y[R_Y_COUNT+i]
 	end
+	if i <= R_Y_COUNT then
+		Get_RP_X_90[(RP_COUNT-R_Y_COUNT)+i] = Get_RP_X[i]
+		Get_RP_Y_90[(RP_COUNT-R_Y_COUNT)+i] = Get_RP_Y[i]
+	end
+end
+
+function DRAW_R_SKIRT()
+
+	fout:write(";\r\n;Pillar raft skirt \r\n")
+	ABS_E = LAST_E
+	SET_FLOW(RAFT_GAIN)
+	local overlap = NOZZLE_DIA*0.5
+	local x_min = R_MIN_X-overlap
+	local x_max = R_MAX_X+overlap
+	local y_min = R_MIN_Y-overlap
+	local y_max = R_MAX_Y+overlap
+	TRAVEL(x_min,y_min)
+	DRAW_LINE(x_min,y_max)
+	DRAW_LINE(x_max,y_max)
+	DRAW_LINE(x_max,y_min)
+	DRAW_LINE(x_min,y_min)
 	SET_FLOW(100)
 	if ABSOLUTE_E then
 		fout:write("G92 E" , LAST_E , "\r\n")
 	end
-	RETRACT()
-	LINE_OUT(line)
+end
+
+function DRAW_RAFT()
+
+	fout:write(";\r\n;Prime pillar raft \r\n")
+	ABS_E = LAST_E
+	if LAYER % 2 == 0 then
+		for i=1, RP_COUNT/2, 2 do
+			DRAW_LINE(Get_RP_X_90[RP_COUNT-(i-1)],Get_RP_Y_90[RP_COUNT-(i-1)])
+			DRAW_LINE(Get_RP_X_90[RP_COUNT-(i-1)-1],Get_RP_Y_90[RP_COUNT-(i-1)-1])
+			DRAW_LINE(Get_RP_X_90[i],Get_RP_Y_90[i])
+			DRAW_LINE(Get_RP_X_90[i+1],Get_RP_Y_90[i+1])
+		end
+	else
+		for i=1, RP_COUNT/2, 2 do
+			DRAW_LINE(Get_RP_X[RP_COUNT-(i-1)],Get_RP_Y[RP_COUNT-(i-1)])
+			DRAW_LINE(Get_RP_X[RP_COUNT-(i-1)-1],Get_RP_Y[RP_COUNT-(i-1)-1])
+			DRAW_LINE(Get_RP_X[i],Get_RP_Y[i])
+			DRAW_LINE(Get_RP_X[i+1],Get_RP_Y[i+1])
+		end
+	end
+	
+	if ABSOLUTE_E then
+		fout:write("G92 E" , LAST_E , "\r\n")
+	end
 end
 
 function DRAW_PILLAR()
@@ -207,7 +251,7 @@ function DRAW_PILLAR()
 	fout:write(";\r\n;Prime pillar \r\n")
 	UN_RETRACT()
 	ABS_E = LAST_E
-	DRAW_LINE(PPL_X+Get_PPP_X[1],Get_PPP_Y[0])
+	DRAW_LINE(PPL_X+Get_PPP_X[1],PPL_Y+Get_PPP_Y[0])
 	DRAW_LINE(PPL_X+Get_PPP_X[1],PPL_Y+Get_PPP_Y[1])
 	DRAW_LINE(PPL_X-Get_PPP_X[1],PPL_Y+Get_PPP_Y[1])
 	DRAW_LINE(PPL_X-Get_PPP_X[1],PPL_Y-Get_PPP_Y[1])
@@ -224,11 +268,11 @@ function DRAW_PILLAR()
 	DRAW_LINE(PPL_X-Get_PPP_X[4],PPL_Y+Get_PPP_Y[4])
 	DRAW_LINE(PPL_X-Get_PPP_X[4],PPL_Y-Get_PPP_Y[4])
 	DRAW_LINE(PPL_X+Get_PPP_X[4],PPL_Y-Get_PPP_Y[4])
+	DRAW_LINE(PPL_X+Get_PPP_X[4],PPL_Y-Get_PPP_Y[3])
 	if ABSOLUTE_E then
 		fout:write("G92 E" , LAST_E , "\r\n")
 	end
 	RETRACT()
-	fout:write("G0 F" , T_SPEED , " X" , PPL_X , " Y" , PPL_Y , "\r\n")
 end
 
 function E_LENGTH(length) -- Width, Length
@@ -244,6 +288,23 @@ function E_LENGTH(length) -- Width, Length
 	end
 end
 
+function RAFT(line)
+	LINE_OUT(line)
+	RETRACT()
+	if LAYER == 1 then
+		fout:write("G1 F" .. T_SPEED .. " Z" .. FIRST_L_HEIGHT .. "\r\n")
+	end
+	TRAVEL(R_MIN_X,R_MIN_Y)
+	UN_RETRACT()
+	DRAW_R_SKIRT()
+	DRAW_RAFT()
+	RETRACT()
+	if LAYER ~= 1 then
+		GO_TO_LAST()
+		UN_RETRACT()
+	end
+end
+
 function PILLAR(line)
 	RETRACT()
 	GO_TO_PPL()
@@ -254,8 +315,25 @@ function PILLAR(line)
 	LINE_OUT(line)
 end
 
--- read lines
 for line in fin:lines() do
+
+	local abs = string.match(line, "M82")
+	local rel = string.match(line, "M83")
+	if abs then
+		ABSOLUTE_E = true
+	elseif rel then
+		ABSOLUTE_E = false
+	end
+	
+	local cura = string.match(line, "Cura")
+	local kiss = string.match(line, "KISSlicer")
+	if cura then
+		raft_start = 1
+		RAFT_THICKNESS = RAFT_THICKNESS+1
+		PILLAR_ROOF = PILLAR_ROOF+1
+	elseif kiss then
+		raft_start = 0
+	end
 	
 	-- Record X position
 	local X = string.match(line, "X%d+%.%d+")
@@ -269,6 +347,7 @@ for line in fin:lines() do
 		LAST_Y = string.match(Y, "%d+%.%d+")
 	end
 	
+	-- Count layer start comments
 	local layer = string.match(line, ";LAYER:") or string.match(line, "; BEGIN_LAYER")
 	if layer then
 		LAYER = LAYER + 1
@@ -287,13 +366,14 @@ for line in fin:lines() do
 		LAST_E = 0
 	end
 
-	-- Generate prime pillar at the end of each layer.
-	if LAYER ~= LAST_LAYER and LAYER > 2 then
+	-- Generate prime pillar.
+	if LAYER ~= LAST_LAYER and LAYER > RAFT_THICKNESS and PILLAR_ROOF > 0 and LAYER <= PILLAR_ROOF then
 		PILLAR(line)
-	elseif LAYER ~= LAST_LAYER and LAYER == 2 then
-		DRAW_RAFT(line)
+	elseif LAYER ~= LAST_LAYER and LAYER > raft_start and LAYER <= RAFT_THICKNESS and PILLAR_ROOF > 0 and LAYER <= PILLAR_ROOF then
+		RAFT(line)
 	else
 		fout:write( line .. "\n" )
+	
 	end
 	
 	LAST_LAYER = LAYER
